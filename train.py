@@ -1,31 +1,25 @@
 import os
 
 import tensorflow as tf
+import wandb
+from albumentations import Compose, HorizontalFlip, \
+    VerticalFlip, RandomBrightnessContrast, HueSaturationValue, \
+    GaussNoise, ShiftScaleRotate, Blur, RGBShift, ChannelShuffle, OneOf, MotionBlur, MedianBlur, \
+    RandomGamma
 from tensorflow.keras import Sequential
 from tensorflow.keras import mixed_precision
 from tensorflow.keras.callbacks import EarlyStopping
-from tensorflow.keras.layers import Conv2D, Flatten, Dense, MaxPooling2D, Dropout, SpatialDropout2D
-from tensorflow.keras.layers.experimental.preprocessing import RandomFlip, RandomRotation, RandomZoom, Resizing, \
-    RandomTranslation, Rescaling
+from tensorflow.keras.layers import Conv2D, Dense, MaxPooling2D, Dropout, BatchNormalization, SpatialDropout2D, GlobalMaxPooling2D
 from tensorflow.keras.optimizers import Adam
 from tensorflow.python.data import AUTOTUNE
-from tensorflow.python.keras.callbacks import ReduceLROnPlateau
 from tensorflow.python.keras.preprocessing.image_dataset import image_dataset_from_directory
-from tensorflow.keras.regularizers import l2
 from wandb.integration.keras import WandbCallback
 
-import wandb
-from layers import RandomBrightness
-
-physical_devices = tf.config.list_physical_devices('GPU')
-
-tf.config.experimental.set_memory_growth(physical_devices[0], True)
 mixed_precision.set_global_policy('mixed_float16')
 tf.config.optimizer.set_jit(True)
 
 class_dirs = [x[0] for x in os.walk(r"H:\Datasets\DogBreed\train")]
-class_dirs.remove("H:\\Datasets\\DogBreed\\train")
-#classes = [x.replace("H:\\Datasets\\DogBreed\\train\\", "") for x in class_dirs]
+class_dirs.remove(r"H:\Datasets\DogBreed\train")
 
 total = 0
 class_num = 0
@@ -45,73 +39,96 @@ for class_dir in class_dirs:
 
 
 print("Loading data...")
-train_batch_size = 128
-val_batch_size = 128
+batch_size = 64
 seed = None
-image_size = 180
+image_size = 124
 
-train_data = image_dataset_from_directory(r"H:\Datasets\DogBreed\train", batch_size=train_batch_size, seed=seed).prefetch(AUTOTUNE)
-val_data = image_dataset_from_directory(r"H:\Datasets\DogBreed\val", batch_size=val_batch_size, seed=seed).prefetch(AUTOTUNE)
-test_data = image_dataset_from_directory(r"H:\Datasets\DogBreed\test", batch_size=val_batch_size, seed=seed).prefetch(AUTOTUNE)
+transforms = Compose([
+    ShiftScaleRotate(p=0.5, shift_limit=0.0625, scale_limit=0.1, rotate_limit=70),
+    HorizontalFlip(p=0.5),
+    VerticalFlip(p=0.5),
+    OneOf([
+        MotionBlur(p=.2),
+        MedianBlur(blur_limit=3, p=0.1),
+        Blur(blur_limit=3, p=0.1),
+    ], p=0.5),
+    OneOf([
+        RandomBrightnessContrast(p=0.5, brightness_limit=0.6, contrast_limit=0.4),
+        RandomGamma(p=0.5),
+    ], p=0.5),
+    GaussNoise(p=1.0, always_apply=True, var_limit=(10.0, 50.0)),
+    OneOf([ChannelShuffle(p=0.5), RGBShift(p=0.5), HueSaturationValue(p=0.5)], p=0.3),
+])
 
+
+def aug_fn(image):
+    data = {"image": image}
+    aug_data = transforms(**data)
+    aug_img = aug_data["image"]
+
+    return aug_img
+
+
+def augment_data(image, label):
+    image = tf.image.convert_image_dtype(image, tf.float32) * 255.0
+    tf.map_fn(lambda elem: tf.numpy_function(func=aug_fn, inp=[elem], Tout=tf.float32), image)
+
+    return preprocess_data(image, label)
+
+
+def preprocess_data(image, label):
+    image = tf.image.resize(image, [image_size, image_size])
+    image = tf.image.convert_image_dtype(image, tf.float32) / 255.0
+
+    return image, label
+
+
+train_data = image_dataset_from_directory(r"H:\Datasets\DogBreed\train", batch_size=batch_size, seed=seed).map(lambda image, label: preprocess_data(image, label), num_parallel_calls=AUTOTUNE).cache()\
+    .map(lambda image, label: augment_data(image, label), num_parallel_calls=AUTOTUNE).shuffle(64).prefetch(AUTOTUNE)
+val_data = image_dataset_from_directory(r"H:\Datasets\DogBreed\val", batch_size=batch_size, seed=seed).map(lambda image, label: preprocess_data(image, label), num_parallel_calls=AUTOTUNE).cache()
+test_data = image_dataset_from_directory(r"H:\Datasets\DogBreed\test", batch_size=batch_size, seed=seed).map(lambda image, label: preprocess_data(image, label), num_parallel_calls=AUTOTUNE)
 print("Building network...")
 
 model = Sequential([
-    Resizing(image_size, image_size),
-    Rescaling(scale=1. / 255),
-    RandomTranslation(width_factor=0.1, height_factor=0.1, seed=seed),
-    RandomFlip(mode="horizontal", seed=seed),
-    RandomBrightness(factor=0.2, seed=seed),
-    RandomZoom(height_factor=0.1, width_factor=0.1, seed=seed),
-    RandomRotation(factor=0.1, seed=seed),
-    #RandomGrayscale(factor=0.25, seed=seed),
-
-    Conv2D(32, 9, activation="relu"),
-    #SpatialDropout2D(0.4, seed=seed),
-    Conv2D(32, 9, activation="relu"),
-    #SpatialDropout2D(0.4, seed=seed),
+    Conv2D(32, 5, activation="PReLU"),
+    BatchNormalization(),
+    SpatialDropout2D(0.25, seed=seed),
     MaxPooling2D(),
 
-    Conv2D(64, 3, activation="relu"),
-    #SpatialDropout2D(0.4, seed=seed),
-    Conv2D(64, 3, activation="relu"),
-    #SpatialDropout2D(0.4, seed=seed),
+    Conv2D(64, 3, activation="PReLU"),
+    BatchNormalization(),
+    Conv2D(64, 3, activation="PReLU"),
+    BatchNormalization(),
+    SpatialDropout2D(0.25, seed=seed),
     MaxPooling2D(),
 
-    Conv2D(128, 3, activation="relu"),
-    #SpatialDropout2D(0.4, seed=seed),
-    Conv2D(128, 3, activation="relu"),
-    #SpatialDropout2D(0.4, seed=seed),
-    MaxPooling2D(),
+    Conv2D(128, 3, activation="PReLU"),
+    BatchNormalization(),
+    Conv2D(128, 3, activation="PReLU"),
+    BatchNormalization(),
+    SpatialDropout2D(0.25, seed=seed),
+    GlobalMaxPooling2D(),
 
-    Conv2D(256, 3, activation="relu"),
-    #SpatialDropout2D(0.4, seed=seed),
-    Conv2D(256, 3, activation="relu"),
-    #SpatialDropout2D(0.4, seed=seed),
-    MaxPooling2D(),
-
-    Conv2D(512, 3, activation="relu"),
-    # SpatialDropout2D(0.4, seed=seed),
-    Conv2D(512, 3, activation="relu"),
-    # SpatialDropout2D(0.4, seed=seed),
-    MaxPooling2D(),
-
-    Flatten(),
-    Dropout(0.2, seed=seed),
+    Dense(256, activation="PReLU"),
+    Dropout(0.4),
+    Dense(128, activation="PReLU"),
+    Dropout(0.4),
+    Dense(64, activation="PReLU"),
+    Dropout(0.2),
     Dense(len(class_dirs), activation="softmax", dtype="float32")
 ])
 
-opt = Adam(learning_rate=0.0001)
+opt = Adam(learning_rate=0.001)
 model.compile(loss="sparse_categorical_crossentropy", metrics=["accuracy"], optimizer=opt)
 
 print("Training...")
 wandb.init(project="dogbreed-ai")
 es = EarlyStopping(monitor='val_loss', mode='min', patience=10, verbose=1, restore_best_weights=True)
-reduce_lr = ReduceLROnPlateau(factor=0.05, patience=7, monitor="val_loss")
-model.fit(train_data, epochs=2000, validation_data=val_data, callbacks=[WandbCallback(), es, reduce_lr], class_weight=class_weights)
-
-print("Evaluating...")
-model.evaluate(test_data)
+model.fit(train_data, epochs=2000, validation_data=val_data, callbacks=[WandbCallback(), es], class_weight=class_weights)
 
 print("Saving...")
 model.save("model.h5", include_optimizer=False)
+
+print("Evaluating...")
+model.evaluate(test_data)
+model.summary()

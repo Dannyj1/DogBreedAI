@@ -22,7 +22,7 @@ from selenium.webdriver.support.wait import WebDriverWait
 
 # google, bing, unsplash, flickr, all
 site = "all"
-breed = "Labrador Retriever"
+breed = "Doberman Pinscher"
 
 options = webdriver.ChromeOptions()
 options.add_experimental_option('prefs', {'intl.accept_languages': 'en,en_US'})
